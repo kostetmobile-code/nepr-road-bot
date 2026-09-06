@@ -12,10 +12,10 @@ from ai_filter import analyze_text_with_cf_ai, answer_user_question_with_cf_ai
 
 load_dotenv()
 
-API_ID = int(os.getenv("TELEGRAM_API_ID"))
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION")
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nepr-road-bot.onrender.com")
 
 SETTINGS_FILE = "user_settings.json"
@@ -115,14 +115,14 @@ def get_main_keyboard(mode: str = "only_keywords"):
     }
 
 # ==========================================
-# Легковесный Web сервер для облачных платформ (Health Check)
+# Веб-сервер для Render (МГНОВЕННЫЙ ЗАПУСК ПОРТА 10000)
 # ==========================================
 async def start_health_check_server():
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))
     async def handle_client(reader, writer):
         try:
             await reader.read(512)
-            content = "OK: Dnepr Road Bot is actively monitoring"
+            content = "OK: Dnepr Road Bot is running 24/7"
             response = (
                 f"HTTP/1.1 200 OK\r\n"
                 f"Content-Type: text/plain; charset=utf-8\r\n"
@@ -136,9 +136,12 @@ async def start_health_check_server():
         except Exception:
             pass
 
-    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
-    print(f"[Cloud Health-Check] Сервер активен на порту {port}")
-    await server.serve_forever()
+    try:
+        server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+        print(f"✅ [Render Web Port] Веб-сервер мгновенно открыл порт {port}!")
+        await server.serve_forever()
+    except Exception as e:
+        print(f"[Render Port Error] {e}")
 
 # ==========================================
 # Автоматический антисон (Keep-Alive Self Ping)
@@ -146,7 +149,7 @@ async def start_health_check_server():
 async def keep_alive_self_ping():
     print(f"[Anti-Sleep] Фоновый пинг запущен для {RENDER_URL}")
     while True:
-        await asyncio.sleep(600)  # каждые 10 минут
+        await asyncio.sleep(600)
         try:
             resp = await asyncio.to_thread(requests.get, RENDER_URL, timeout=15)
             print(f"[Anti-Sleep] Пинг отправлен: HTTP {resp.status_code}")
@@ -313,7 +316,7 @@ async def bot_polling_loop():
                             send_telegram_bot_message(user_id, ai_answer, reply_markup=get_main_keyboard(mode))
 
         except Exception as e:
-            await asyncio.sleep(4)
+            await asyncio.sleep(3)
         await asyncio.sleep(1)
 
 # ==========================================
@@ -321,16 +324,27 @@ async def bot_polling_loop():
 # ==========================================
 async def main():
     print("=" * 60)
-    print("🚀 Запуск системы мониторинга (Мгновенные оповещения)")
+    print("🚀 Запуск системы мониторинга Днепра")
     print("=" * 60)
 
-    if STRING_SESSION:
-        print("☁️ Обнаружена сессия облака (TELEGRAM_STRING_SESSION)!")
-        client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    else:
-        client = TelegramClient("user_session", API_ID, API_HASH)
+    # 1. МГНОВЕННО открываем порт для Render, чтобы он считал сервис здоровым (Healthy)
+    asyncio.create_task(start_health_check_server())
+    asyncio.create_task(keep_alive_self_ping())
 
-    await client.start()
+    # 2. Подключение к Telegram
+    while True:
+        try:
+            if STRING_SESSION:
+                print("☁️ Подключение через TELEGRAM_STRING_SESSION...")
+                client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+            else:
+                client = TelegramClient("user_session", API_ID, API_HASH)
+
+            await client.start()
+            break
+        except Exception as e:
+            print(f"[Telegram Start Error] {e}. Повтор через 5с...")
+            await asyncio.sleep(5)
 
     me = await client.get_me()
     print(f"✅ Вход в Telegram выполнен успешно: {me.first_name} (@{me.username})")
@@ -345,7 +359,7 @@ async def main():
             sources_to_preload.append(entity)
             print(f"📡 Подключен канал: @{username} (ID: {entity.id})")
 
-            # ПОДКЛЮЧАЕМ КОММЕНТАРИИ ДЛЯ ВСЕХ КАНАЛОВ!
+            # Подключаем комментарии для всех каналов
             try:
                 full_ch = await client(GetFullChannelRequest(entity))
                 linked_id = full_ch.full_chat.linked_chat_id
@@ -358,14 +372,15 @@ async def main():
                     sources_to_preload.append(linked_entity)
                     print(f"💬 Подключены комментарии для @{username} (ID: {linked_entity.id})")
             except Exception as e:
-                print(f"⚠️ Ошибка поиска комментариев для @{username}: {e}")
+                print(f"⚠️ Комментарии для @{username} не найдены: {e}")
         except Exception as e:
             print(f"❌ Ошибка подключения к @{username}: {e}")
 
-    print("🔄 Наполнение базы из каналов и комментариев (до 40 сообщений назад)...")
+    # Загрузка актуальной базы
+    print("🔄 Наполнение базы из каналов и комментариев...")
     for src in sources_to_preload:
         try:
-            async for m in client.iter_messages(src, limit=40):
+            async for m in client.iter_messages(src, limit=35):
                 if m.text and len(m.text) > 4:
                     res = analyze_text_with_cf_ai(m.text)
                     if res.get("relevant") is True:
@@ -382,13 +397,13 @@ async def main():
             pass
 
     target_chat_ids = list(monitored_entities.keys())
-    print(f"🎯 Всего активных источников (каналы + комментарии): {len(target_chat_ids)}")
+    print(f"🎯 Всего активных источников: {len(target_chat_ids)}")
     print("=" * 60)
 
+    # Запуск опроса команд
     asyncio.create_task(bot_polling_loop())
-    asyncio.create_task(start_health_check_server())
-    asyncio.create_task(keep_alive_self_ping())
 
+    # Обработчик новых сообщений
     @client.on(events.NewMessage(chats=target_chat_ids))
     async def incoming_handler(event):
         text = event.raw_text
@@ -468,8 +483,15 @@ async def main():
         else:
             print("⚪ Отсеяно ИИ")
 
-    print("\n👂 Бот активен в реальном времени с защитой от засыпания!")
-    await client.run_until_disconnected()
+    print("\n👂 Бот активен! Готов к непрерывной работе 24/7.")
+    
+    # Бесконечный цикл, чтобы Telethon НИКОГДА не завершал процесс при обрыве связи
+    while True:
+        try:
+            await client.run_until_disconnected()
+        except Exception as e:
+            print(f"[Telethon Socket Drop] {e}. Переподключение через 5с...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     try:
