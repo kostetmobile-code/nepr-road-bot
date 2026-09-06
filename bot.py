@@ -16,6 +16,7 @@ API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nepr-road-bot.onrender.com")
 
 SETTINGS_FILE = "user_settings.json"
 EVENTS_FILE = "events_history.json"
@@ -75,6 +76,9 @@ def load_events() -> list:
 
 def save_event(event_dict: dict):
     events_list = load_events()
+    for existing in events_list:
+        if existing.get("raw_text") == event_dict.get("raw_text"):
+            return
     events_list.append(event_dict)
     if len(events_list) > 100:
         events_list = events_list[-100:]
@@ -137,6 +141,19 @@ async def start_health_check_server():
     await server.serve_forever()
 
 # ==========================================
+# Автоматический антисон (Keep-Alive Self Ping)
+# ==========================================
+async def keep_alive_self_ping():
+    print(f"[Anti-Sleep] Фоновый пинг запущен для {RENDER_URL}")
+    while True:
+        await asyncio.sleep(600)  # каждые 10 минут
+        try:
+            resp = await asyncio.to_thread(requests.get, RENDER_URL, timeout=15)
+            print(f"[Anti-Sleep] Пинг отправлен: HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[Anti-Sleep Ошибка] {e}")
+
+# ==========================================
 # Фоновый диалог бота
 # ==========================================
 async def bot_polling_loop():
@@ -197,9 +214,9 @@ async def bot_polling_loop():
                                 f"👋 Здравствуйте, <b>{user_name}</b>!\n\n"
                                 "✅ <b>Бот мгновенного мониторинга дорожной обстановки в Днепре готов к работе!</b>\n\n"
                                 "💡 <b>Как настроить бот под себя:</b>\n"
-                                "• Нажмите <b>«➕ Добавить слово»</b>, чтобы вписать свои улицы (например: <i>Калиновая</i>, <i>Правда</i>, <i>Новый мост</i>).\n"
+                                "• Нажмите <b>«➕ Добавить слово»</b>, чтобы вписать свои улицы (например: <i>Калиновая</i>, <i>Дамба</i>, <i>Малиновского</i>, <i>Южный мост</i>).\n"
                                 "• Бот моментально присылает предупреждения по вашим локациям!\n"
-                                "• Вы также можете спросить: <i>«Что на Победе?»</i>."
+                                "• Вы также можете спросить: <i>«Что на дамбе?»</i>."
                             )
                             send_telegram_bot_message(user_id, welcome, reply_markup=get_main_keyboard(mode))
 
@@ -209,7 +226,7 @@ async def bot_polling_loop():
                             send_telegram_bot_message(
                                 user_id,
                                 "✍️ <b>Напишите название улицы, моста или района:</b>\n"
-                                "<i>(Например: Калиновая, Победа, Новый мост, Рабочая, Левый берег)</i>",
+                                "<i>(Например: Калиновая, Дамба, Малиновского, Южный мост, Победа, Рабочая)</i>",
                                 reply_markup=cancel_kb
                             )
 
@@ -253,13 +270,18 @@ async def bot_polling_loop():
                         elif raw_text == "📋 Последняя сводка":
                             events_list = load_events()
                             if not events_list:
-                                reply = "ℹ️ За последнее время активных предупреждений не зафиксировано."
+                                reply = (
+                                    "ℹ️ <b>Сейчас на дорогах Днепра спокойно!</b>\n\n"
+                                    "За последнее время свежих сообщений о блокпостах или проверках не поступало.\n"
+                                    "Как только появится новая информация — бот сразу же пришлет вам уведомление!"
+                                )
                             else:
-                                lines = ["📋 <b>Последние зафиксированные события в Днепре:</b>\n"]
-                                for ev in reversed(events_list[-8:]):
+                                lines = ["📋 <b>Актуальная сводка событий по Днепру:</b>\n"]
+                                for ev in reversed(events_list[-10:]):
                                     lines.append(
-                                        f"🕒 <b>{ev['time']}</b> — 📍 <b>{ev['location']}</b>\n"
-                                        f"⚠️ {ev['status']}: {ev['summary']}\n"
+                                        f"🕒 <b>{ev.get('time', '')}</b> — 📍 <b>{ev.get('location', '')}</b>\n"
+                                        f"⚠️ <b>{ev.get('status', '')}:</b> {ev.get('summary', '')}\n"
+                                        f"💬 <i>«{ev.get('raw_text', '')[:120]}»</i>\n"
                                     )
                                 reply = "\n".join(lines)
                             send_telegram_bot_message(user_id, reply, reply_markup=get_main_keyboard(mode))
@@ -271,7 +293,7 @@ async def bot_polling_loop():
                                 "2. <b>Режимы:</b>\n"
                                 "   • <i>Только мои слова</i> — оповещения только при совпадении с вашим маршрутом.\n"
                                 "   • <i>Все события</i> — уведомления по всему Днепру.\n"
-                                "3. <b>Вопросы ИИ:</b> Напишите в чате: <i>«Что на Победе?»</i> — нейросеть Cloudflare ответит вам!"
+                                "3. <b>Вопросы ИИ:</b> Напишите в чате: <i>«Что на дамбе?»</i> — нейросеть Cloudflare ответит вам!"
                             )
                             send_telegram_bot_message(user_id, help_msg, reply_markup=get_main_keyboard(mode))
 
@@ -302,7 +324,6 @@ async def main():
     print("🚀 Запуск системы мониторинга (Мгновенные оповещения)")
     print("=" * 60)
 
-    # Инициализация сессии: либо из переменной окружения (облако), либо из файла (ПК)
     if STRING_SESSION:
         print("☁️ Обнаружена сессия облака (TELEGRAM_STRING_SESSION)!")
         client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -315,35 +336,37 @@ async def main():
     print(f"✅ Вход в Telegram выполнен успешно: {me.first_name} (@{me.username})")
 
     monitored_entities = {}
-    
+    sources_to_preload = []
+
     for username in CHANNELS_TO_MONITOR:
         try:
             entity = await client.get_entity(username)
             monitored_entities[entity.id] = {"name": f"@{username}", "type": "Канал"}
+            sources_to_preload.append(entity)
             print(f"📡 Подключен канал: @{username} (ID: {entity.id})")
 
-            if username == "agendaDnepr":
-                try:
-                    full_ch = await client(GetFullChannelRequest(entity))
-                    linked_id = full_ch.full_chat.linked_chat_id
-                    if linked_id:
-                        linked_entity = await client.get_entity(linked_id)
-                        monitored_entities[linked_entity.id] = {
-                            "name": f"@{username} (Комментарии)",
-                            "type": "Комментарий"
-                        }
-                        print(f"💬 Подключен чат комментариев для @{username} (ID: {linked_entity.id})")
-                except Exception as e:
-                    print(f"⚠️ Ошибка подключения комментариев для @{username}: {e}")
+            # ПОДКЛЮЧАЕМ КОММЕНТАРИИ ДЛЯ ВСЕХ КАНАЛОВ!
+            try:
+                full_ch = await client(GetFullChannelRequest(entity))
+                linked_id = full_ch.full_chat.linked_chat_id
+                if linked_id:
+                    linked_entity = await client.get_entity(linked_id)
+                    monitored_entities[linked_entity.id] = {
+                        "name": f"@{username} (Комментарии)",
+                        "type": "Комментарий"
+                    }
+                    sources_to_preload.append(linked_entity)
+                    print(f"💬 Подключены комментарии для @{username} (ID: {linked_entity.id})")
+            except Exception as e:
+                print(f"⚠️ Ошибка поиска комментариев для @{username}: {e}")
         except Exception as e:
             print(f"❌ Ошибка подключения к @{username}: {e}")
 
-    # Первоначальное наполнение базы последними событиями
-    print("🔄 Наполнение актуальной базы из каналов...")
-    for username in CHANNELS_TO_MONITOR:
+    print("🔄 Наполнение базы из каналов и комментариев (до 40 сообщений назад)...")
+    for src in sources_to_preload:
         try:
-            async for m in client.iter_messages(username, limit=10):
-                if m.text and len(m.text) > 6:
+            async for m in client.iter_messages(src, limit=40):
+                if m.text and len(m.text) > 4:
                     res = analyze_text_with_cf_ai(m.text)
                     if res.get("relevant") is True:
                         t_str = m.date.strftime("%H:%M") if m.date else datetime.datetime.now().strftime("%H:%M")
@@ -353,20 +376,19 @@ async def main():
                             "status": res.get("status", "Внимание"),
                             "summary": res.get("summary", m.text[:100]),
                             "raw_text": m.text.strip(),
-                            "source": f"@{username}"
+                            "source": getattr(src, "username", "Чат")
                         })
         except Exception:
             pass
 
     target_chat_ids = list(monitored_entities.keys())
-    print(f"🎯 Всего активных источников: {len(target_chat_ids)}")
+    print(f"🎯 Всего активных источников (каналы + комментарии): {len(target_chat_ids)}")
     print("=" * 60)
 
-    # Запускаем задачи: опрос диалогов и веб-сервер проверки здоровья для облака
     asyncio.create_task(bot_polling_loop())
     asyncio.create_task(start_health_check_server())
+    asyncio.create_task(keep_alive_self_ping())
 
-    # Обработчик новых сообщений: срабатывает МГНОВЕННО (в пределах 1 секунды)
     @client.on(events.NewMessage(chats=target_chat_ids))
     async def incoming_handler(event):
         text = event.raw_text
@@ -378,7 +400,6 @@ async def main():
         
         print(f"\n⚡ [Мгновенный перехват] {source_info['name']}: {text[:70]}...")
 
-        # Анализ нейросетью Cloudflare AI
         analysis = analyze_text_with_cf_ai(text)
         
         if analysis.get("relevant") is True:
@@ -447,7 +468,7 @@ async def main():
         else:
             print("⚪ Отсеяно ИИ")
 
-    print("\n👂 Бот активен в реальном времени! Готов к развертыванию в облаке.")
+    print("\n👂 Бот активен в реальном времени с защитой от засыпания!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
