@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncio
 import json
 import datetime
@@ -10,13 +12,46 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetFullChannelRequest
 from ai_filter import analyze_text_with_cf_ai, answer_user_question_with_cf_ai
 
-load_dotenv()
+# =========================================================================
+# 1. ЗАГРУЗКА КЛЮЧЕЙ (В Render Docker секретные файлы хранятся в /etc/secrets/)
+# =========================================================================
+if os.path.exists("/etc/secrets/.env"):
+    print("[Config] Загрузка ключей из /etc/secrets/.env (Render Docker)")
+    load_dotenv("/etc/secrets/.env")
+else:
+    load_dotenv()
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nepr-road-bot.onrender.com")
+
+# =========================================================================
+# 2. МГНОВЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER (Запускается на строке 1 в потоке)
+# =========================================================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK: Dnepr Road Bot is actively monitoring 24/7")
+
+    def log_message(self, format, *args):
+        pass  # без лишнего спама в консоль
+
+def run_immediate_http():
+    port = int(os.getenv("PORT", 10000))
+    try:
+        httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
+        print(f"🚀 [Render Web Port] Сервер мгновенно открыл порт {port} на 0.0.0.0!")
+        httpd.serve_forever()
+    except Exception as e:
+        print(f"[Render Port Error] {e}")
+
+# Запуск порта СРАЗУ, чтобы Render мгновенно увидел его и дал Live
+web_thread = threading.Thread(target=run_immediate_http, daemon=True)
+web_thread.start()
 
 SETTINGS_FILE = "user_settings.json"
 EVENTS_FILE = "events_history.json"
@@ -113,35 +148,6 @@ def get_main_keyboard(mode: str = "only_keywords"):
         ],
         "resize_keyboard": True
     }
-
-# ==========================================
-# Веб-сервер для Render (МГНОВЕННЫЙ ЗАПУСК ПОРТА 10000)
-# ==========================================
-async def start_health_check_server():
-    port = int(os.getenv("PORT", 10000))
-    async def handle_client(reader, writer):
-        try:
-            await reader.read(512)
-            content = "OK: Dnepr Road Bot is running 24/7"
-            response = (
-                f"HTTP/1.1 200 OK\r\n"
-                f"Content-Type: text/plain; charset=utf-8\r\n"
-                f"Content-Length: {len(content.encode('utf-8'))}\r\n"
-                f"Connection: close\r\n\r\n"
-                f"{content}"
-            )
-            writer.write(response.encode("utf-8"))
-            await writer.drain()
-            writer.close()
-        except Exception:
-            pass
-
-    try:
-        server = await asyncio.start_server(handle_client, "0.0.0.0", port)
-        print(f"✅ [Render Web Port] Веб-сервер мгновенно открыл порт {port}!")
-        await server.serve_forever()
-    except Exception as e:
-        print(f"[Render Port Error] {e}")
 
 # ==========================================
 # Автоматический антисон (Keep-Alive Self Ping)
@@ -325,10 +331,10 @@ async def bot_polling_loop():
 async def main():
     print("=" * 60)
     print("🚀 Запуск системы мониторинга Днепра")
+    print(f"API_ID: {'Найден' if API_ID else 'ОШИБКА: 0'}, BOT_TOKEN: {'Найден' if BOT_TOKEN else 'ОШИБКА'}")
     print("=" * 60)
 
-    # 1. МГНОВЕННО открываем порт для Render, чтобы он считал сервис здоровым (Healthy)
-    asyncio.create_task(start_health_check_server())
+    # 1. Запуск анти-сна
     asyncio.create_task(keep_alive_self_ping())
 
     # 2. Подключение к Telegram
@@ -485,7 +491,6 @@ async def main():
 
     print("\n👂 Бот активен! Готов к непрерывной работе 24/7.")
     
-    # Бесконечный цикл, чтобы Telethon НИКОГДА не завершал процесс при обрыве связи
     while True:
         try:
             await client.run_until_disconnected()
