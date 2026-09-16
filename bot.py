@@ -9,11 +9,11 @@ import requests
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from ai_filter import analyze_text_with_cf_ai, answer_user_question_with_cf_ai
 
 # =========================================================================
-# 1. ЗАГРУЗКА КЛЮЧЕЙ (В Render Docker секретные файлы хранятся в /etc/secrets/)
+# 1. ЗАГРУЗКА КЛЮЧЕЙ
 # =========================================================================
 if os.path.exists("/etc/secrets/.env"):
     print("[Config] Загрузка ключей из /etc/secrets/.env (Render Docker)")
@@ -28,28 +28,41 @@ STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nepr-road-bot.onrender.com")
 
 # =========================================================================
-# 2. МГНОВЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER (Запускается на строке 1 в потоке)
+# 2. ВРЕМЕННОЙ ПОЯС КИЕВ / ДНЕПР (UTC+3)
+# =========================================================================
+KYIV_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+def to_kyiv_time(dt=None) -> datetime.datetime:
+    """Возвращает точное местное время Днепра (UTC+3)"""
+    if dt is None:
+        return datetime.datetime.now(KYIV_TZ)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(KYIV_TZ)
+
+# =========================================================================
+# 3. МГНОВЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER (Порт 10000)
 # =========================================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK: Dnepr Road Bot is actively monitoring 24/7")
+        now_str = to_kyiv_time().strftime("%Y-%m-%d %H:%M:%S")
+        self.wfile.write(f"OK: Dnepr Road Bot is actively running. Kyiv time: {now_str}".encode("utf-8"))
 
     def log_message(self, format, *args):
-        pass  # без лишнего спама в консоль
+        pass
 
 def run_immediate_http():
     port = int(os.getenv("PORT", 10000))
     try:
         httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
-        print(f"🚀 [Render Web Port] Сервер мгновенно открыл порт {port} на 0.0.0.0!")
+        print(f"🚀 [Render Web Port] Веб-сервер мгновенно открыл порт {port} на 0.0.0.0!")
         httpd.serve_forever()
     except Exception as e:
         print(f"[Render Port Error] {e}")
 
-# Запуск порта СРАЗУ, чтобы Render мгновенно увидел его и дал Live
 web_thread = threading.Thread(target=run_immediate_http, daemon=True)
 web_thread.start()
 
@@ -57,7 +70,21 @@ SETTINGS_FILE = "user_settings.json"
 EVENTS_FILE = "events_history.json"
 CHANNELS_TO_MONITOR = ["pridybai", "dnepr_bez_tck", "agendaDnepr"]
 
-recent_alerts = []
+# Журнал самоотладки (хранит последние 20 перехваченных сообщений и причину решения)
+audit_log = []
+
+# Дедупликация с ограничением по времени (15 минут)
+recent_alerts_map = {}
+
+def is_duplicate_alert(key: str, ttl_minutes: int = 15) -> bool:
+    now_ts = datetime.datetime.now().timestamp()
+    expired = [k for k, ts in recent_alerts_map.items() if now_ts - ts > ttl_minutes * 60]
+    for k in expired:
+        del recent_alerts_map[k]
+    if key in recent_alerts_map:
+        return True
+    recent_alerts_map[key] = now_ts
+    return False
 
 # ==========================================
 # Управление пользователями и ключевыми словами
@@ -82,7 +109,7 @@ def get_user(chat_id: int, user_name: str = "Пользователь") -> dict:
         users[uid] = {
             "name": user_name,
             "keywords": [],
-            "mode": "only_keywords",
+            "mode": "all",  # По умолчанию ставим "all" (все события), чтобы новичок не пропускал опасность!
             "state": None
         }
         save_all_users(users)
@@ -138,13 +165,13 @@ def send_telegram_bot_message(chat_id: int, text: str, reply_markup=None):
     except Exception as e:
         print(f"[Bot Send Error] {e}")
 
-def get_main_keyboard(mode: str = "only_keywords"):
-    mode_text = "🎯 Режим: Только мои слова" if mode == "only_keywords" else "🔔 Режим: Все события"
+def get_main_keyboard(mode: str = "all"):
+    mode_text = "🎯 Режим: Только мои слова" if mode == "only_keywords" else "🔔 Режим: Все события города"
     return {
         "keyboard": [
             [{"text": "📋 Последняя сводка"}, {"text": "📍 Мои локации"}],
             [{"text": "➕ Добавить слово"}, {"text": "❌ Удалить слово"}],
-            [{"text": mode_text}, {"text": "❓ Как пользоваться"}]
+            [{"text": mode_text}, {"text": "🛠 Диагностика"}]
         ],
         "resize_keyboard": True
     }
@@ -161,6 +188,45 @@ async def keep_alive_self_ping():
             print(f"[Anti-Sleep] Пинг отправлен: HTTP {resp.status_code}")
         except Exception as e:
             print(f"[Anti-Sleep Ошибка] {e}")
+
+# ==========================================
+# Формирование отчета самодиагностики
+# ==========================================
+def build_diagnostic_report(user_id: int) -> str:
+    kyiv_now = to_kyiv_time().strftime("%H:%M:%S")
+    user = get_user(user_id)
+    u_mode = user.get("mode", "all")
+    u_keywords = user.get("keywords", [])
+    
+    mode_str = "🎯 Только мои слова" if u_mode == "only_keywords" else "🔔 Все события города"
+    kw_str = ", ".join(u_keywords) if u_keywords else "(список пуст)"
+
+    lines = [
+        "🛠 <b>САМОДИАГНОСТИКА И СТАТУС БОТА:</b>\n",
+        f"🕒 <b>Точное время (Днепр):</b> <code>{kyiv_now}</code> (UTC+3)",
+        f"⚙️ <b>Ваш режим:</b> <b>{mode_str}</b>",
+        f"📍 <b>Ваши ключевые слова:</b> <code>{kw_str}</code>\n"
+    ]
+
+    if u_mode == "only_keywords" and u_keywords:
+        lines.append(
+            "⚠️ <b>ВНИМАНИЕ:</b> У вас включен режим фильтрации!\n"
+            f"Бот присылает сообщения <b>ТОЛЬКО</b> если в тексте есть: <i>{kw_str}</i>.\n"
+            "Все остальные блокпосты города отсекаются вашим личным фильтром!\n"
+            "<i>(Чтобы получать ВСЕ события города, нажмите кнопку «Режим» внизу).</i>\n"
+        )
+
+    lines.append("📜 <b>Последние перехваченные сообщения из эфира:</b>")
+    if not audit_log:
+        lines.append("<i>Пока сообщений в журнале нет (ожидаем новые публикации).</i>")
+    else:
+        for item in reversed(audit_log[-6:]):
+            lines.append(
+                f"• [{item['time']}] <b>{item['source']}</b>: «{item['text']}»\n"
+                f"  └ <b>Вердикт:</b> {item['decision']}"
+            )
+
+    return "\n".join(lines)
 
 # ==========================================
 # Фоновый диалог бота
@@ -185,7 +251,7 @@ async def bot_polling_loop():
                         user = get_user(user_id, user_name)
                         state = user.get("state")
                         keywords = user.get("keywords", [])
-                        mode = user.get("mode", "only_keywords")
+                        mode = user.get("mode", "all")
 
                         if state == "wait_add":
                             if raw_text in ["/cancel", "отмена", "Отмена"]:
@@ -198,7 +264,7 @@ async def bot_polling_loop():
                                 update_user(user_id, {"keywords": keywords, "state": None})
                                 success_msg = (
                                     f"✅ Локация <b>«{new_kw}»</b> успешно добавлена!\n\n"
-                                    f"Теперь бот будет мгновенно отслеживать любые проверки и блокпосты с этим словом."
+                                    f"Теперь бот будет отслеживать любые проверки и блокпосты с этим словом."
                                 )
                                 send_telegram_bot_message(user_id, success_msg, reply_markup=get_main_keyboard(mode))
                             continue
@@ -222,12 +288,16 @@ async def bot_polling_loop():
                             welcome = (
                                 f"👋 Здравствуйте, <b>{user_name}</b>!\n\n"
                                 "✅ <b>Бот мгновенного мониторинга дорожной обстановки в Днепре готов к работе!</b>\n\n"
-                                "💡 <b>Как настроить бот под себя:</b>\n"
-                                "• Нажмите <b>«➕ Добавить слово»</b>, чтобы вписать свои улицы (например: <i>Калиновая</i>, <i>Дамба</i>, <i>Малиновского</i>, <i>Южный мост</i>).\n"
-                                "• Бот моментально присылает предупреждения по вашим локациям!\n"
-                                "• Вы также можете спросить: <i>«Что на дамбе?»</i>."
+                                "💡 <b>Как это работает:</b>\n"
+                                "• Бот непрерывно слушает каналы и комментарии Днепра.\n"
+                                "• Если где-то стоит патруль или проверка — вы сразу получаете тревожное сообщение.\n"
+                                "• Нажмите <b>«🛠 Диагностика»</b>, чтобы в любой момент проверить статус бота и последние перехваченные фразы!"
                             )
                             send_telegram_bot_message(user_id, welcome, reply_markup=get_main_keyboard(mode))
+
+                        elif raw_text in ["🛠 Диагностика", "/debug", "/diag"]:
+                            report = build_diagnostic_report(user_id)
+                            send_telegram_bot_message(user_id, report, reply_markup=get_main_keyboard(mode))
 
                         elif raw_text == "➕ Добавить слово":
                             update_user(user_id, {"state": "wait_add"})
@@ -254,9 +324,9 @@ async def bot_polling_loop():
                                 )
 
                         elif raw_text == "📍 Мои локации":
-                            mode_desc = "🎯 <i>Только мои слова (лишний шум отсекается)</i>" if mode == "only_keywords" else "🔔 <i>Все события по городу</i>"
+                            mode_desc = "🎯 <i>Только мои слова</i>" if mode == "only_keywords" else "🔔 <i>Все события города</i>"
                             if not keywords:
-                                kw_list_text = "<i>(Список пуст. Добавьте улицы кнопкой «➕ Добавить слово»)</i>"
+                                kw_list_text = "<i>(Список пуст. Вы получаете все важные события города)</i>"
                             else:
                                 kw_list_text = "\n".join([f"• <b>{k}</b>" for k in keywords])
 
@@ -271,9 +341,9 @@ async def bot_polling_loop():
                             new_mode = "all" if mode == "only_keywords" else "only_keywords"
                             update_user(user_id, {"mode": new_mode})
                             if new_mode == "only_keywords":
-                                desc = "🎯 Включен режим <b>«Только мои слова»</b>. Бот присылает сообщения только если упомянуты ваши локации!"
+                                desc = "🎯 Включен режим <b>«Только мои слова»</b>. Вы будете получать тревоги ТОЛЬКО по вашим ключевым словам!"
                             else:
-                                desc = "🔔 Включен режим <b>«Все события»</b>. Присылаются все подтвержденные отчеты со всего города."
+                                desc = "🔔 Включен режим <b>«Все события города»</b>. Теперь вы не пропустите ни один блокпост в Днепре!"
                             send_telegram_bot_message(user_id, desc, reply_markup=get_main_keyboard(new_mode))
 
                         elif raw_text == "📋 Последняя сводка":
@@ -281,11 +351,11 @@ async def bot_polling_loop():
                             if not events_list:
                                 reply = (
                                     "ℹ️ <b>Сейчас на дорогах Днепра спокойно!</b>\n\n"
-                                    "За последнее время свежих сообщений о блокпостах или проверках не поступало.\n"
+                                    "За последнее время активных предупреждений не зафиксировано.\n"
                                     "Как только появится новая информация — бот сразу же пришлет вам уведомление!"
                                 )
                             else:
-                                lines = ["📋 <b>Актуальная сводка событий по Днепру:</b>\n"]
+                                lines = ["📋 <b>Актуальная сводка событий по Днепру (от свежих к старым):</b>\n"]
                                 for ev in reversed(events_list[-10:]):
                                     lines.append(
                                         f"🕒 <b>{ev.get('time', '')}</b> — 📍 <b>{ev.get('location', '')}</b>\n"
@@ -294,17 +364,6 @@ async def bot_polling_loop():
                                     )
                                 reply = "\n".join(lines)
                             send_telegram_bot_message(user_id, reply, reply_markup=get_main_keyboard(mode))
-
-                        elif raw_text == "❓ Как пользоваться":
-                            help_msg = (
-                                "📖 <b>Инструкция:</b>\n\n"
-                                "1. <b>Ключевые слова:</b> Нажмите <i>«➕ Добавить слово»</i> и введите улицы своего маршрута.\n"
-                                "2. <b>Режимы:</b>\n"
-                                "   • <i>Только мои слова</i> — оповещения только при совпадении с вашим маршрутом.\n"
-                                "   • <i>Все события</i> — уведомления по всему Днепру.\n"
-                                "3. <b>Вопросы ИИ:</b> Напишите в чате: <i>«Что на дамбе?»</i> — нейросеть Cloudflare ответит вам!"
-                            )
-                            send_telegram_bot_message(user_id, help_msg, reply_markup=get_main_keyboard(mode))
 
                         else:
                             print(f"[Q&A] Вопрос от {user_name}: {raw_text}")
@@ -332,12 +391,11 @@ async def main():
     print("=" * 60)
     print("🚀 Запуск системы мониторинга Днепра")
     print(f"API_ID: {'Найден' if API_ID else 'ОШИБКА: 0'}, BOT_TOKEN: {'Найден' if BOT_TOKEN else 'ОШИБКА'}")
+    print(f"🕒 Время сервера: {to_kyiv_time().strftime('%H:%M:%S')} (Kyiv UTC+3)")
     print("=" * 60)
 
-    # 1. Запуск анти-сна
     asyncio.create_task(keep_alive_self_ping())
 
-    # 2. Подключение к Telegram
     while True:
         try:
             if STRING_SESSION:
@@ -365,7 +423,7 @@ async def main():
             sources_to_preload.append(entity)
             print(f"📡 Подключен канал: @{username} (ID: {entity.id})")
 
-            # Подключаем комментарии для всех каналов
+            # Вступаем и подключаем чаты комментариев
             try:
                 full_ch = await client(GetFullChannelRequest(entity))
                 linked_id = full_ch.full_chat.linked_chat_id
@@ -376,7 +434,13 @@ async def main():
                         "type": "Комментарий"
                     }
                     sources_to_preload.append(linked_entity)
-                    print(f"💬 Подключены комментарии для @{username} (ID: {linked_entity.id})")
+                    
+                    # ОБЯЗАТЕЛЬНО ВСТУПАЕМ В ЧАТ КОММЕНТАРИЕВ ДЛЯ ПРИЕМА ЖИВЫХ СООБЩЕНИЙ!
+                    try:
+                        await client(JoinChannelRequest(linked_entity))
+                        print(f"✅ Вступили в чат комментариев для @{username} (ID: {linked_entity.id})")
+                    except Exception as je:
+                        print(f"ℹ️ Статус участия в комментариях @{username}: {je}")
             except Exception as e:
                 print(f"⚠️ Комментарии для @{username} не найдены: {e}")
         except Exception as e:
@@ -390,7 +454,7 @@ async def main():
                 if m.text and len(m.text) > 4:
                     res = analyze_text_with_cf_ai(m.text)
                     if res.get("relevant") is True:
-                        t_str = m.date.strftime("%H:%M") if m.date else datetime.datetime.now().strftime("%H:%M")
+                        t_str = to_kyiv_time(m.date).strftime("%H:%M")
                         save_event({
                             "time": t_str,
                             "location": res.get("location", "Днепр"),
@@ -403,13 +467,11 @@ async def main():
             pass
 
     target_chat_ids = list(monitored_entities.keys())
-    print(f"🎯 Всего активных источников: {len(target_chat_ids)}")
+    print(f"🎯 Всего активных источников (каналы + комментарии): {len(target_chat_ids)}")
     print("=" * 60)
 
-    # Запуск опроса команд
     asyncio.create_task(bot_polling_loop())
 
-    # Обработчик новых сообщений
     @client.on(events.NewMessage(chats=target_chat_ids))
     async def incoming_handler(event):
         text = event.raw_text
@@ -419,8 +481,13 @@ async def main():
         chat_id = event.chat_id
         source_info = monitored_entities.get(chat_id, {"name": "Чат", "type": "Сообщение"})
         
-        print(f"\n⚡ [Мгновенный перехват] {source_info['name']}: {text[:70]}...")
+        # Точное время отправки сообщения по Киеву/Днепру
+        msg_time = to_kyiv_time(event.message.date if event.message and event.message.date else None)
+        time_str = msg_time.strftime("%H:%M")
 
+        print(f"\n⚡ [{time_str}] [Перехват] {source_info['name']}: {text[:70]}...")
+
+        # Анализ (ИИ + резервные правила)
         analysis = analyze_text_with_cf_ai(text)
         
         if analysis.get("relevant") is True:
@@ -429,16 +496,15 @@ async def main():
             summary = analysis.get("summary", text[:100])
 
             alert_key = f"{location}_{status}".lower()
-            now = datetime.datetime.now()
-            if alert_key in recent_alerts:
-                print(f"⏩ Пропуск дубликата: {alert_key}")
+            if is_duplicate_alert(alert_key, ttl_minutes=15):
+                print(f"⏩ Пропуск дубликата (в пределах 15 мин): {alert_key}")
+                audit_log.append({
+                    "time": time_str,
+                    "source": source_info['name'],
+                    "text": text[:60],
+                    "decision": f"⏩ Дубликат (уже было за последние 15 мин: {location})"
+                })
                 return
-            
-            recent_alerts.append(alert_key)
-            if len(recent_alerts) > 50:
-                recent_alerts.pop(0)
-
-            time_str = now.strftime("%H:%M")
 
             save_event({
                 "time": time_str,
@@ -451,11 +517,14 @@ async def main():
 
             searchable_text = f"{location} {summary} {text}".lower()
             all_users = load_all_users()
-            print(f"🔔 Мгновенная рассылка по {len(all_users)} пользователям...")
+            print(f"🔔 Рассылка по {len(all_users)} пользователям...")
+
+            sent_count = 0
+            filtered_count = 0
 
             for uid_str, udata in all_users.items():
                 uid = int(uid_str)
-                u_mode = udata.get("mode", "only_keywords")
+                u_mode = udata.get("mode", "all")
                 u_keywords = udata.get("keywords", [])
 
                 matched_kw = None
@@ -486,10 +555,40 @@ async def main():
                         f"🕒 <b>Время:</b> {time_str}"
                     )
                     send_telegram_bot_message(uid, alert_message, reply_markup=get_main_keyboard(u_mode))
-        else:
-            print("⚪ Отсеяно ИИ")
+                    sent_count += 1
+                else:
+                    filtered_count += 1
 
-    print("\n👂 Бот активен! Готов к непрерывной работе 24/7.")
+            # Запись в аудит-лог
+            if sent_count > 0:
+                audit_log.append({
+                    "time": time_str,
+                    "source": source_info['name'],
+                    "text": text[:60],
+                    "decision": f"✅ Опасность отправлена! ({location} - {status})"
+                })
+            else:
+                audit_log.append({
+                    "time": time_str,
+                    "source": source_info['name'],
+                    "text": text[:60],
+                    "decision": f"⚠️ Зафиксировано ({location}), но отфильтровано вашим списком ключевых слов"
+                })
+
+            if len(audit_log) > 25:
+                audit_log.pop(0)
+
+        else:
+            audit_log.append({
+                "time": time_str,
+                "source": source_info['name'],
+                "text": text[:60],
+                "decision": f"⚪ Отсеяно ({analysis.get('reason', 'неактуально/вопрос')})"
+            })
+            if len(audit_log) > 25:
+                audit_log.pop(0)
+
+    print("\n👂 Бот активен в реальном времени с защитой от засыпания!")
     
     while True:
         try:
