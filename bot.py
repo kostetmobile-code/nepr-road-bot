@@ -1,6 +1,18 @@
 import os
 import sys
 import threading
+
+# === Исправление кодировки Windows (cp1251 -> UTF-8) для эмодзи в print() ===
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncio
 import json
