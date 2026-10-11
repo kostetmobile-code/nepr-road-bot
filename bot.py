@@ -18,6 +18,8 @@ import asyncio
 import json
 import datetime
 import requests
+import re
+import html
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -37,6 +39,12 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
+if not STRING_SESSION and os.path.exists("session_string.txt"):
+    try:
+        with open("session_string.txt", "r", encoding="utf-8") as f:
+            STRING_SESSION = f.read().strip()
+    except Exception:
+        pass
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nepr-road-bot.onrender.com")
 
 # =========================================================================
@@ -84,6 +92,7 @@ CHANNELS_TO_MONITOR = ["pridybai", "dnepr_bez_tck", "agendaDnepr"]
 
 # Журнал самоотладки (хранит последние 20 перехваченных сообщений и причину решения)
 audit_log = []
+telethon_status = "Инициализация..."
 
 # Дедупликация с ограничением по времени (15 минут)
 recent_alerts_map = {}
@@ -149,15 +158,59 @@ def load_events() -> list:
     return []
 
 def save_event(event_dict: dict):
+    if "timestamp" not in event_dict:
+        event_dict["timestamp"] = int(to_kyiv_time().timestamp())
     events_list = load_events()
+
+    # Дедупликация идентичного текста в пределах 15 минут
+    cur_ts = event_dict.get("timestamp", 0)
     for existing in events_list:
         if existing.get("raw_text") == event_dict.get("raw_text"):
-            return
+            ex_ts = existing.get("timestamp", 0)
+            if abs(cur_ts - ex_ts) < 900:
+                return
+
     events_list.append(event_dict)
+
+    # Храним события за последние 24 часа (или не более 100)
+    now_ts = to_kyiv_time().timestamp()
+    events_list = [ev for ev in events_list if now_ts - ev.get("timestamp", now_ts) < 24 * 3600]
     if len(events_list) > 100:
         events_list = events_list[-100:]
+
     with open(EVENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(events_list, f, ensure_ascii=False, indent=2)
+
+def is_within_minutes(event_dict: dict, max_minutes: int = 90) -> bool:
+    """Проверяет, произошло ли событие за последние N минут (по умолчанию 90 мин)."""
+    kyiv_now = to_kyiv_time()
+
+    # 1. Если есть сохраненный точный UNIX-timestamp
+    ts = event_dict.get("timestamp")
+    if ts:
+        diff_sec = kyiv_now.timestamp() - ts
+        return 0 <= diff_sec <= (max_minutes * 60)
+
+    # 2. Если есть строковое время 'HH:MM'
+    t_str = event_dict.get("time", "")
+    try:
+        parts = t_str.split(":")
+        if len(parts) == 2:
+            ev_hour = int(parts[0])
+            ev_minute = int(parts[1])
+            ev_dt = kyiv_now.replace(hour=ev_hour, minute=ev_minute, second=0, microsecond=0)
+
+            # Если время в событии позже текущего времени Киева более чем на 5 минут,
+            # значит событие произошло вчера вечером (например: сейчас 00:50, событие 23:30)
+            if ev_dt > kyiv_now + datetime.timedelta(minutes=5):
+                ev_dt -= datetime.timedelta(days=1)
+
+            diff_sec = (kyiv_now - ev_dt).total_seconds()
+            return 0 <= diff_sec <= (max_minutes * 60)
+    except Exception:
+        pass
+
+    return False
 
 # ==========================================
 # Отправка сообщений и Меню
@@ -177,6 +230,110 @@ def send_telegram_bot_message(chat_id: int, text: str, reply_markup=None):
     except Exception as e:
         print(f"[Bot Send Error] {e}")
 
+def dispatch_alert(event_data: dict, is_historical: bool = False):
+    """
+    Сохраняет событие и при необходимости рассылает уведомления подписчикам бота.
+    """
+    location = event_data.get("location", "Днепр")
+    status = event_data.get("status", "Внимание")
+    summary = event_data.get("summary", "")
+    text = event_data.get("raw_text", "")
+    source_name = event_data.get("source", "Канал")
+    time_str = event_data.get("time", "")
+
+    # 1. Сохраняем в локальную историю
+    save_event(event_data)
+
+    if is_historical:
+        # Для архивных сообщений (первичная загрузка при старте) уведомления не рассылаем
+        return
+
+    # 2. Проверка на дубликат алерта в течение 15 минут
+    alert_key = f"{location}_{status}".lower()
+    if is_duplicate_alert(alert_key, ttl_minutes=15):
+        print(f"⏩ Пропуск дубликата (в пределах 15 мин): {alert_key}")
+        audit_log.append({
+            "time": time_str,
+            "source": source_name,
+            "text": text[:60],
+            "decision": f"⏩ Дубликат (уже было за последние 15 мин: {location})"
+        })
+        return
+
+    # 3. Рассылка по пользователям
+    searchable_text = f"{location} {summary} {text}".lower()
+    all_users = load_all_users()
+    print(f"🔔 Рассылка по {len(all_users)} пользователям: [{location}] {status}...")
+
+    sent_count = 0
+    filtered_count = 0
+
+    for uid_str, udata in all_users.items():
+        try:
+            uid = int(uid_str)
+        except Exception:
+            continue
+        u_mode = udata.get("mode", "all")
+        u_keywords = udata.get("keywords", [])
+
+        matched_kw = None
+        for kw in u_keywords:
+            if kw.lower() in searchable_text:
+                matched_kw = kw
+                break
+
+        should_send = False
+        if status != "Чисто":
+            if u_mode == "all":
+                should_send = True
+            elif u_mode == "only_keywords":
+                if not u_keywords or matched_kw:
+                    should_send = True
+        else:
+            # Для статуса "Чисто" шлем пуш только если пользователь явно отслеживает эту локацию
+            if matched_kw:
+                should_send = True
+
+        if should_send:
+            if status == "Чисто":
+                header_title = "🟢 <b>Дорожная обстановка: чисто</b>"
+            else:
+                header_title = "🚨 <b>Внимание: дорожная обстановка</b>"
+
+            match_header = f"🎯 <b>По вашему фильтру: «{matched_kw}»</b>\n\n" if matched_kw else ""
+            alert_message = (
+                f"{header_title}\n"
+                f"{match_header}"
+                f"📍 <b>Локация:</b> {location}\n"
+                f"⚠️ <b>Статус:</b> {status}\n"
+                f"📝 <b>Суть:</b> {summary}\n\n"
+                f"💬 <i>«{text.strip()}»</i>\n\n"
+                f"🔗 <b>Источник:</b> {source_name}\n"
+                f"🕒 <b>Время:</b> {time_str}"
+            )
+            send_telegram_bot_message(uid, alert_message, reply_markup=get_main_keyboard(u_mode))
+            sent_count += 1
+        else:
+            filtered_count += 1
+
+    if sent_count > 0:
+        audit_log.append({
+            "time": time_str,
+            "source": source_name,
+            "text": text[:60],
+            "decision": f"✅ Опасность отправлена! ({location} - {status})"
+        })
+    else:
+        audit_log.append({
+            "time": time_str,
+            "source": source_name,
+            "text": text[:60],
+            "decision": f"⚠️ Зафиксировано ({location}), но отфильтровано вашим списком ключевых слов"
+        })
+
+    if len(audit_log) > 25:
+        audit_log.pop(0)
+
 def get_main_keyboard(mode: str = "all"):
     mode_text = "🎯 Режим: Только мои слова" if mode == "only_keywords" else "🔔 Режим: Все события города"
     return {
@@ -185,7 +342,8 @@ def get_main_keyboard(mode: str = "all"):
             [{"text": "➕ Добавить слово"}, {"text": "❌ Удалить слово"}],
             [{"text": mode_text}, {"text": "🛠 Диагностика"}]
         ],
-        "resize_keyboard": True
+        "resize_keyboard": True,
+        "is_persistent": True
     }
 
 # ==========================================
@@ -216,6 +374,7 @@ def build_diagnostic_report(user_id: int) -> str:
     lines = [
         "🛠 <b>САМОДИАГНОСТИКА И СТАТУС БОТА:</b>\n",
         f"🕒 <b>Точное время (Днепр):</b> <code>{kyiv_now}</code> (UTC+3)",
+        f"📡 <b>Слушатель каналов:</b> <code>{telethon_status}</code>",
         f"⚙️ <b>Ваш режим:</b> <b>{mode_str}</b>",
         f"📍 <b>Ваши ключевые слова:</b> <code>{kw_str}</code>\n"
     ]
@@ -270,14 +429,22 @@ async def bot_polling_loop():
                                 update_user(user_id, {"state": None})
                                 send_telegram_bot_message(user_id, "❌ Добавление отменено.", reply_markup=get_main_keyboard(mode))
                             else:
-                                new_kw = raw_text.strip().title()
-                                if new_kw.lower() not in [k.lower() for k in keywords]:
-                                    keywords.append(new_kw)
+                                raw_items = [x.strip() for x in raw_text.split(",") if x.strip()]
+                                added = []
+                                for item in raw_items:
+                                    item_title = item.title()
+                                    if item_title.lower() not in [k.lower() for k in keywords]:
+                                        keywords.append(item_title)
+                                        added.append(item_title)
                                 update_user(user_id, {"keywords": keywords, "state": None})
-                                success_msg = (
-                                    f"✅ Локация <b>«{new_kw}»</b> успешно добавлена!\n\n"
-                                    f"Теперь бот будет отслеживать любые проверки и блокпосты с этим словом."
-                                )
+                                if added:
+                                    added_str = ", ".join([f"«{a}»" for a in added])
+                                    success_msg = (
+                                        f"✅ Добавлено: <b>{added_str}</b>!\n\n"
+                                        f"Теперь бот будет отслеживать любые проверки и блокпосты по этим ориентирам."
+                                    )
+                                else:
+                                    success_msg = "ℹ️ Эти локации уже есть в вашем списке."
                                 send_telegram_bot_message(user_id, success_msg, reply_markup=get_main_keyboard(mode))
                             continue
 
@@ -286,24 +453,25 @@ async def bot_polling_loop():
                                 update_user(user_id, {"state": None})
                                 send_telegram_bot_message(user_id, "❌ Удаление отменено.", reply_markup=get_main_keyboard(mode))
                             else:
-                                kw_to_del = raw_text.strip().lower()
-                                new_keywords = [k for k in keywords if k.lower() != kw_to_del]
-                                if len(new_keywords) < len(keywords):
-                                    update_user(user_id, {"keywords": new_keywords, "state": None})
-                                    send_telegram_bot_message(user_id, f"🗑 Локация <b>«{raw_text}»</b> удалена.", reply_markup=get_main_keyboard(mode))
+                                del_items = [x.strip().lower() for x in raw_text.split(",") if x.strip()]
+                                new_keywords = [k for k in keywords if k.lower() not in del_items]
+                                removed_count = len(keywords) - len(new_keywords)
+                                update_user(user_id, {"keywords": new_keywords, "state": None})
+                                if removed_count > 0:
+                                    send_telegram_bot_message(user_id, f"🗑 Удалено локаций: {removed_count}.", reply_markup=get_main_keyboard(mode))
                                 else:
-                                    update_user(user_id, {"state": None})
-                                    send_telegram_bot_message(user_id, f"Слово <b>«{raw_text}»</b> не найдено в списке.", reply_markup=get_main_keyboard(mode))
+                                    send_telegram_bot_message(user_id, f"Указанные локации не найдены в вашем списке.", reply_markup=get_main_keyboard(mode))
                             continue
 
-                        if raw_text == "/start":
+                        if raw_text in ["/start", "/menu", "меню", "Меню"]:
+                            update_user(user_id, {"state": None})
                             welcome = (
                                 f"👋 Здравствуйте, <b>{user_name}</b>!\n\n"
-                                "✅ <b>Бот мгновенного мониторинга дорожной обстановки в Днепре готов к работе!</b>\n\n"
-                                "💡 <b>Как это работает:</b>\n"
-                                "• Бот непрерывно слушает каналы и комментарии Днепра.\n"
-                                "• Если где-то стоит патруль или проверка — вы сразу получаете тревожное сообщение.\n"
-                                "• Нажмите <b>«🛠 Диагностика»</b>, чтобы в любой момент проверить статус бота и последние перехваченные фразы!"
+                                "✅ <b>Главное меню дорожной обстановки в Днепре:</b>\n\n"
+                                "Выберите действие на клавиатуре внизу 👇\n"
+                                "• <b>📋 Последняя сводка</b> — свежие сообщения\n"
+                                "• <b>📍 Мои локации</b> — ваши фильтры\n"
+                                "• <b>🛠 Диагностика</b> — проверить связь и статус бота"
                             )
                             send_telegram_bot_message(user_id, welcome, reply_markup=get_main_keyboard(mode))
 
@@ -360,15 +528,21 @@ async def bot_polling_loop():
 
                         elif raw_text == "📋 Последняя сводка":
                             events_list = load_events()
-                            if not events_list:
+                            # СТРОГИЙ ФИЛЬТР: ТОЛЬКО СОБЫТИЯ ЗА ПОСЛЕДНИЕ 90 МИНУТ!
+                            recent_90m = [ev for ev in events_list if is_within_minutes(ev, max_minutes=90)]
+
+                            if not recent_90m:
                                 reply = (
-                                    "ℹ️ <b>Сейчас на дорогах Днепра спокойно!</b>\n\n"
-                                    "За последнее время активных предупреждений не зафиксировано.\n"
+                                    "ℹ️ <b>За последние 90 минут на дорогах Днепра спокойно!</b>\n\n"
+                                    "Свежих сообщений о блокпостах или проверках за последние 90 минут не зафиксировано.\n"
+                                    "<i>(Все более старые события старше 1.5 часов автоматически скрыты).</i>\n\n"
                                     "Как только появится новая информация — бот сразу же пришлет вам уведомление!"
                                 )
                             else:
-                                lines = ["📋 <b>Актуальная сводка событий по Днепру (от свежих к старым):</b>\n"]
-                                for ev in reversed(events_list[-10:]):
+                                lines = [
+                                    f"📋 <b>Актуальная сводка по Днепру за последние 90 минут ({len(recent_90m)} сообщ.):</b>\n"
+                                ]
+                                for ev in reversed(recent_90m[-15:]):
                                     lines.append(
                                         f"🕒 <b>{ev.get('time', '')}</b> — 📍 <b>{ev.get('location', '')}</b>\n"
                                         f"⚠️ <b>{ev.get('status', '')}:</b> {ev.get('summary', '')}\n"
@@ -380,6 +554,7 @@ async def bot_polling_loop():
                         else:
                             print(f"[Q&A] Вопрос от {user_name}: {raw_text}")
                             events_list = load_events()
+                            recent_90m = [ev for ev in events_list if is_within_minutes(ev, max_minutes=90)]
                             try:
                                 requests.post(
                                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
@@ -389,7 +564,7 @@ async def bot_polling_loop():
                             except Exception:
                                 pass
 
-                            ai_answer = await asyncio.to_thread(answer_user_question_with_cf_ai, raw_text, events_list)
+                            ai_answer = await asyncio.to_thread(answer_user_question_with_cf_ai, raw_text, recent_90m)
                             send_telegram_bot_message(user_id, ai_answer, reply_markup=get_main_keyboard(mode))
 
         except Exception as e:
@@ -397,33 +572,176 @@ async def bot_polling_loop():
         await asyncio.sleep(1)
 
 # ==========================================
-# Главная функция запуска
+# Фоновый сборщик публичных каналов (Web Preview)
 # ==========================================
-async def main():
-    print("=" * 60)
-    print("🚀 Запуск системы мониторинга Днепра")
-    print(f"API_ID: {'Найден' if API_ID else 'ОШИБКА: 0'}, BOT_TOKEN: {'Найден' if BOT_TOKEN else 'ОШИБКА'}")
-    print(f"🕒 Время сервера: {to_kyiv_time().strftime('%H:%M:%S')} (Kyiv UTC+3)")
-    print("=" * 60)
+seen_web_post_ids = set()
 
-    asyncio.create_task(keep_alive_self_ping())
+async def poll_public_channels():
+    """
+    Фоновый сборщик публичных каналов через веб-превью Telegram (https://t.me/s/{channel}).
+    Работает 100% надёжно, независимо от Telethon сессий и конфликтов аккаунтов.
+    """
+    global seen_web_post_ids
+    print("🌐 [Web Poller] Фоновый сборщик публичных каналов запущен!")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    is_first_cycle = True
 
     while True:
         try:
+            for ch in CHANNELS_TO_MONITOR:
+                url = f"https://t.me/s/{ch}"
+                try:
+                    resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
+                    if resp.status_code != 200:
+                        continue
+                    content = resp.text
+                    raw_msgs = content.split('class="tgme_widget_message_wrap')
+                    for b in raw_msgs[1:]:
+                        post_match = re.search(r'data-post="([^"]+)"', b)
+                        time_match = re.search(r'<time[^>]*datetime="([^"]+)"', b)
+                        text_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.DOTALL)
+
+                        if not post_match or not text_match:
+                            continue
+
+                        post_id = post_match.group(1)
+                        if post_id in seen_web_post_ids:
+                            continue
+                        seen_web_post_ids.add(post_id)
+
+                        iso_time = time_match.group(1) if time_match else None
+                        raw_html_text = text_match.group(1)
+                        clean_text = re.sub(r'<br\s*/?>', '\n', raw_html_text)
+                        clean_text = re.sub(r'<[^>]+>', '', clean_text)
+                        clean_text = html.unescape(clean_text).strip()
+
+                        if not clean_text or len(clean_text) < 3:
+                            continue
+
+                        # Расчет точного времени Киева
+                        if iso_time:
+                            try:
+                                dt = datetime.datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+                                dt_kyiv = dt.astimezone(KYIV_TZ)
+                                time_str = dt_kyiv.strftime("%H:%M")
+                                ts = int(dt.timestamp())
+                            except Exception:
+                                dt_kyiv = to_kyiv_time()
+                                time_str = dt_kyiv.strftime("%H:%M")
+                                ts = int(dt_kyiv.timestamp())
+                        else:
+                            dt_kyiv = to_kyiv_time()
+                            time_str = dt_kyiv.strftime("%H:%M")
+                            ts = int(dt_kyiv.timestamp())
+
+                        # Анализ текста ключевыми словами (мгновенно 0.001с)
+                        analysis = analyze_text_with_cf_ai(clean_text)
+
+                        if analysis.get("relevant") is True:
+                            location = analysis.get("location", "Днепр")
+                            status = analysis.get("status", "Внимание")
+                            summary = analysis.get("summary", clean_text[:100])
+
+                            event_data = {
+                                "time": time_str,
+                                "timestamp": ts,
+                                "location": location,
+                                "status": status,
+                                "summary": summary,
+                                "raw_text": clean_text,
+                                "source": f"@{ch}"
+                            }
+
+                            # В первый цикл подгружаем события за последние 90 минут в историю, не тревожа пушами
+                            kyiv_now_ts = to_kyiv_time().timestamp()
+                            is_old = (kyiv_now_ts - ts > 90 * 60) if ts else False
+                            is_historical = is_first_cycle or is_old
+
+                            dispatch_alert(event_data, is_historical=is_historical)
+                        else:
+                            if not is_first_cycle:
+                                audit_log.append({
+                                    "time": time_str,
+                                    "source": f"@{ch}",
+                                    "text": clean_text[:60],
+                                    "decision": f"⚪ Отсеяно ({analysis.get('reason', 'неактуально/вопрос')})"
+                                })
+                                if len(audit_log) > 25:
+                                    audit_log.pop(0)
+
+                except Exception as ch_err:
+                    pass
+                await asyncio.sleep(2)
+
+            if is_first_cycle:
+                print(f"✅ [Web Poller] Начальная сводка за 90 минут успешно загружена! Отслеживается {len(seen_web_post_ids)} постов.")
+                is_first_cycle = False
+
+        except Exception as e:
+            print(f"[Web Poller Loop Error] {e}")
+
+        await asyncio.sleep(30)
+
+
+# ==========================================
+# Фоновый слушатель каналов Telethon
+# ==========================================
+async def run_telethon_listener():
+    global telethon_status
+    print("[Telethon] Запуск слушателя каналов...")
+
+    if not STRING_SESSION and not os.path.exists("user_session.session"):
+        telethon_status = "❌ Нет TELEGRAM_STRING_SESSION"
+        print(f"[Telethon] {telethon_status}")
+        return
+
+    while True:
+        client = None
+        try:
             if STRING_SESSION:
-                print("☁️ Подключение через TELEGRAM_STRING_SESSION...")
                 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
             else:
                 client = TelegramClient("user_session", API_ID, API_HASH)
 
-            await client.start()
+            await client.connect()
+            if not await client.is_user_authorized():
+                telethon_status = "⚠️ Сессия не авторизована"
+                print(f"[Telethon] {telethon_status}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(60)
+                continue
+
+            me = await client.get_me()
+            telethon_status = f"✅ Активен ({me.first_name})"
+            print(f"✅ Вход в Telegram выполнен успешно: {me.first_name} (@{me.username})")
             break
         except Exception as e:
-            print(f"[Telegram Start Error] {e}. Повтор через 5с...")
-            await asyncio.sleep(5)
-
-    me = await client.get_me()
-    print(f"✅ Вход в Telegram выполнен успешно: {me.first_name} (@{me.username})")
+            err_str = str(e)
+            if "AuthKeyDuplicatedError" in type(e).__name__ or "different IP addresses" in err_str:
+                telethon_status = "⚠️ Сессия занята другим сервером (Render)"
+                print(f"[Telethon] {telethon_status}. Ожидание 60с...")
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                await asyncio.sleep(60)
+            else:
+                telethon_status = f"Ошибка ({e})"
+                print(f"[Telethon Start Error] {e}. Повтор через 15с...")
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                await asyncio.sleep(15)
 
     monitored_entities = {}
     sources_to_preload = []
@@ -447,7 +765,6 @@ async def main():
                     }
                     sources_to_preload.append(linked_entity)
                     
-                    # ОБЯЗАТЕЛЬНО ВСТУПАЕМ В ЧАТ КОММЕНТАРИЕВ ДЛЯ ПРИЕМА ЖИВЫХ СООБЩЕНИЙ!
                     try:
                         await client(JoinChannelRequest(linked_entity))
                         print(f"✅ Вступили в чат комментариев для @{username} (ID: {linked_entity.id})")
@@ -462,7 +779,7 @@ async def main():
     print("🔄 Наполнение базы из каналов и комментариев...")
     for src in sources_to_preload:
         try:
-            async for m in client.iter_messages(src, limit=35):
+            async for m in client.iter_messages(src, limit=25):
                 if m.text and len(m.text) > 4:
                     res = analyze_text_with_cf_ai(m.text)
                     if res.get("relevant") is True:
@@ -482,8 +799,6 @@ async def main():
     print(f"🎯 Всего активных источников (каналы + комментарии): {len(target_chat_ids)}")
     print("=" * 60)
 
-    asyncio.create_task(bot_polling_loop())
-
     @client.on(events.NewMessage(chats=target_chat_ids))
     async def incoming_handler(event):
         text = event.raw_text
@@ -499,7 +814,7 @@ async def main():
 
         print(f"\n⚡ [{time_str}] [Перехват] {source_info['name']}: {text[:70]}...")
 
-        # Анализ (ИИ + резервные правила)
+        # Анализ (мгновенно по ключевым словам)
         analysis = analyze_text_with_cf_ai(text)
         
         if analysis.get("relevant") is True:
@@ -507,89 +822,16 @@ async def main():
             status = analysis.get("status", "Внимание")
             summary = analysis.get("summary", text[:100])
 
-            alert_key = f"{location}_{status}".lower()
-            if is_duplicate_alert(alert_key, ttl_minutes=15):
-                print(f"⏩ Пропуск дубликата (в пределах 15 мин): {alert_key}")
-                audit_log.append({
-                    "time": time_str,
-                    "source": source_info['name'],
-                    "text": text[:60],
-                    "decision": f"⏩ Дубликат (уже было за последние 15 мин: {location})"
-                })
-                return
-
-            save_event({
+            event_data = {
                 "time": time_str,
+                "timestamp": int(msg_time.timestamp()),
                 "location": location,
                 "status": status,
                 "summary": summary,
                 "raw_text": text.strip(),
                 "source": source_info['name']
-            })
-
-            searchable_text = f"{location} {summary} {text}".lower()
-            all_users = load_all_users()
-            print(f"🔔 Рассылка по {len(all_users)} пользователям...")
-
-            sent_count = 0
-            filtered_count = 0
-
-            for uid_str, udata in all_users.items():
-                uid = int(uid_str)
-                u_mode = udata.get("mode", "all")
-                u_keywords = udata.get("keywords", [])
-
-                matched_kw = None
-                for kw in u_keywords:
-                    if kw.lower() in searchable_text:
-                        matched_kw = kw
-                        break
-
-                should_send = False
-                if u_mode == "all":
-                    should_send = True
-                elif u_mode == "only_keywords":
-                    if not u_keywords:
-                        should_send = True
-                    elif matched_kw:
-                        should_send = True
-
-                if should_send:
-                    match_header = f"🎯 <b>По вашему фильтру: «{matched_kw}»</b>\n\n" if matched_kw else ""
-                    alert_message = (
-                        f"🚨 <b>Внимание: дорожная обстановка</b>\n"
-                        f"{match_header}"
-                        f"📍 <b>Локация:</b> {location}\n"
-                        f"⚠️ <b>Статус:</b> {status}\n"
-                        f"📝 <b>Суть:</b> {summary}\n\n"
-                        f"💬 <i>«{text.strip()}»</i>\n\n"
-                        f"🔗 <b>Источник:</b> {source_info['name']}\n"
-                        f"🕒 <b>Время:</b> {time_str}"
-                    )
-                    send_telegram_bot_message(uid, alert_message, reply_markup=get_main_keyboard(u_mode))
-                    sent_count += 1
-                else:
-                    filtered_count += 1
-
-            # Запись в аудит-лог
-            if sent_count > 0:
-                audit_log.append({
-                    "time": time_str,
-                    "source": source_info['name'],
-                    "text": text[:60],
-                    "decision": f"✅ Опасность отправлена! ({location} - {status})"
-                })
-            else:
-                audit_log.append({
-                    "time": time_str,
-                    "source": source_info['name'],
-                    "text": text[:60],
-                    "decision": f"⚠️ Зафиксировано ({location}), но отфильтровано вашим списком ключевых слов"
-                })
-
-            if len(audit_log) > 25:
-                audit_log.pop(0)
-
+            }
+            dispatch_alert(event_data, is_historical=False)
         else:
             audit_log.append({
                 "time": time_str,
@@ -600,7 +842,7 @@ async def main():
             if len(audit_log) > 25:
                 audit_log.pop(0)
 
-    print("\n👂 Бот активен в реальном времени с защитой от засыпания!")
+    print("\n👂 Слушатель каналов Telethon активен!")
     
     while True:
         try:
@@ -608,6 +850,34 @@ async def main():
         except Exception as e:
             print(f"[Telethon Socket Drop] {e}. Переподключение через 5с...")
             await asyncio.sleep(5)
+
+
+# ==========================================
+# Главная функция запуска
+# ==========================================
+async def main():
+    print("=" * 60)
+    print("🚀 Запуск системы мониторинга Днепра (Режим: Ключевые слова)")
+    print(f"API_ID: {'Найден' if API_ID else 'ОШИБКА: 0'}, BOT_TOKEN: {'Найден' if BOT_TOKEN else 'ОШИБКА'}")
+    print(f"🕒 Время сервера: {to_kyiv_time().strftime('%H:%M:%S')} (Kyiv UTC+3)")
+    print("=" * 60)
+
+    # 1. Запуск пинга антисна для Render
+    asyncio.create_task(keep_alive_self_ping())
+
+    # 2. МГНОВЕННО запускаем меню бота (чтобы кнопки и команды работали сразу с 1-й секунды!)
+    asyncio.create_task(bot_polling_loop())
+
+    # 3. Запускаем фоновый сборщик публичных каналов (работает надежно без сессий Telethon)
+    asyncio.create_task(poll_public_channels())
+
+    # 4. В фоне запускаем слушатель каналов Telethon
+    asyncio.create_task(run_telethon_listener())
+
+    # Основной цикл ожидания
+    while True:
+        await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     try:
